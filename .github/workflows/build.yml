@@ -9,7 +9,7 @@ on:
       devices:
         description: 'Device codenames (space-separated, or "all")'
         required: true
-        default: 'all'
+        default: 'kodiak'
 
 jobs:
   # ------------------------------------------------------------------
@@ -240,20 +240,3 @@ jobs:
             printf '%s' "$DEVICE_LIST"
             echo "EOF"
           } >> "$GITHUB_OUTPUT"
-
-      - name: Notify Telegram
-        if: steps.aggregate.outputs.has_new == 'true'
-        uses: appleboy/telegram-action@v1
-        with:
-          to: ${{ secrets.TELEGRAM_CHAT_ID }}
-          token: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          disable_web_page_preview: true
-          format: markdown
-          message: |
-            **Pixel Props — New OTA Available !**
-
-            **Tag**: [${{ steps.aggregate.outputs.tag }}](https://github.com/${{ github.repository }}/releases/tag/${{ steps.aggregate.outputs.tag }})
-            **Modules**: ${{ steps.aggregate.outputs.count }}
-
-            **Devices**:
-            ${{ steps.aggregate.outputs.devices }}
