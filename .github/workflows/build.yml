@@ -11,6 +11,9 @@ on:
         required: true
         default: 'kodiak'
 
+permissions:
+  contents: read
+
 jobs:
   # ------------------------------------------------------------------
   # PREPARE: Determine which devices to build based on input or default list
@@ -45,7 +48,7 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
   # ------------------------------------------------------------------
-  # BUILD: Download OTA, extract props, build module, and check for duplicates
+  # BUILD: Download OTA, generate system.prop and a device-specific PIF JSON
   # ------------------------------------------------------------------
   build:
     needs: prepare
@@ -74,169 +77,156 @@ jobs:
       - name: Extract and build
         run: bash extract_images.sh
 
-      # Check if this module version was already released to avoid duplicates
-      - name: Check for duplicates
+      - name: Generate and check PIF JSON
         id: check
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          DEVICE_CODENAME: ${{ matrix.device }}
         run: |
-          zip=$(find . -maxdepth 1 -name "*.zip" -type f -print -quit 2>/dev/null)
-          if [ -z "$zip" ]; then
+          system_prop=$(find extracted_images -type f -name "system.prop" -print -quit 2>/dev/null)
+          if [ -z "$system_prop" ]; then
+            echo "No system.prop was generated"
             echo "has_new=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-
-          name=$(basename "$zip")
-          echo "Built: $name"
-
-          # Paginate through ALL releases to build a complete asset list
-          EXISTING=$(mktemp)
-          trap 'rm -f "$EXISTING"' EXIT
-
-          page=1
-          while :; do
-            assets=$(gh api "repos/${{ github.repository }}/releases?per_page=100&page=${page}" \
-              --jq '.[] | .assets[].name' 2>/dev/null)
-            [ -z "$assets" ] && break
-            printf '%s\n' "$assets" >> "$EXISTING"
-            page=$((page + 1))
-          done
-
-          # Skip if this exact zip was already released
-          if grep -qxF "$name" "$EXISTING" 2>/dev/null; then
-            echo "SKIP (already released): $name"
-            echo "has_new=false" >> "$GITHUB_OUTPUT"
-            rm -f "$zip"
-            exit 0
-          fi
-
-          # Extract metadata from the built module
-          codename=$(echo "$name" | cut -d_ -f1 | tr '[:upper:]' '[:lower:]')
-          prop=$(find extracted_images -maxdepth 2 -name "module.prop" -path "*/${codename}-ota-*" 2>/dev/null | head -1)
-          prop_dir=$(dirname "$prop")
-          desc=""
-          device_name=""
-          build_desc=""
-          if [ -f "$prop" ]; then
-            desc=$(grep '^description=' "$prop" | cut -d= -f2- | head -1)
-            if [ -f "$prop_dir/system.prop" ]; then
-              device_name=$(grep -m1 '^ro.product.model=' "$prop_dir/system.prop" 2>/dev/null | cut -d= -f2- | head -1)
-              build_desc=$(grep -m1 '^ro.build.description=' "$prop_dir/system.prop" 2>/dev/null | cut -d= -f2- | head -1)
-            fi
-          fi
-          [ -z "$device_name" ] && device_name="${codename^}"
-
-          zip_hash=$(sha256sum "$zip" | awk '{print $1}')
 
           mkdir -p upload
-          mv "$zip" upload/
+          name=$(python3 - "$system_prop" <<'PY'
+          import json
+          import os
+          import re
+          import sys
+          from pathlib import Path
 
-          # Save structured metadata for the release aggregation step
-          jq -n \
-            --arg codename "$codename" \
-            --arg zip_name "$name" \
-            --arg sha256 "$zip_hash" \
-            --arg device_name "$device_name" \
-            --arg description "$desc" \
-            --arg build_desc "$build_desc" \
-            '{codename: $codename, zip_name: $zip_name, sha256: $sha256, device_name: $device_name, description: $description, build_desc: $build_desc}' \
-            > "upload/metadata-${codename}.json"
+          props = {}
+          with open(sys.argv[1], encoding="utf-8") as system_prop:
+              for line in system_prop:
+                  line = line.rstrip("\r\n")
+                  if not line or line.lstrip().startswith("#") or "=" not in line:
+                      continue
+                  key, value = line.split("=", 1)
+                  props[key.strip()] = value
+
+          template = json.loads(Path("pif.json").read_text(encoding="utf-8"))
+          pif = {}
+          for field, reference in template.items():
+              if isinstance(reference, str) and reference.startswith("$"):
+                  prop_name = reference[1:]
+                  if prop_name not in props:
+                      raise SystemExit(
+                          f"Missing property {prop_name!r} required for PIF field {field!r}"
+                      )
+                  pif[field] = props[prop_name]
+              else:
+                  pif[field] = reference
+
+          build_id = props.get("ro.vendor.build.id", "")
+          if not build_id:
+              raise SystemExit("Missing ro.vendor.build.id in system.prop")
+
+          codename = re.sub(r"[^A-Za-z0-9._-]+", "_", os.environ["DEVICE_CODENAME"])
+          build_id = re.sub(r"[^A-Za-z0-9._-]+", "_", build_id)
+          if not codename or not build_id:
+              raise SystemExit("Could not form a safe PIF filename")
+
+          name = f"pif-{codename}-{build_id}.json"
+          Path("upload", name).write_text(
+              json.dumps(pif, indent=4, ensure_ascii=False) + "\n",
+              encoding="utf-8",
+          )
+          print(name)
+          PY
+          )
+          echo "Generated: $name"
+
+          # Each device/build has its own release so every release can expose pif.json.
+          release_tag="${name%.json}"
+          if gh release view "$release_tag" --json assets --jq '.assets[].name' 2>/dev/null \
+            | grep -qxF "pif.json"; then
+            echo "SKIP (already released): $release_tag"
+            echo "has_new=false" >> "$GITHUB_OUTPUT"
+            rm -f "upload/$name"
+            exit 0
+          fi
 
           echo "has_new=true" >> "$GITHUB_OUTPUT"
 
-      # Upload module + metadata artifact for the release job to collect
       - name: Upload artifact
         if: steps.check.outputs.has_new == 'true'
         uses: actions/upload-artifact@v4
         with:
-          name: module-${{ matrix.device }}
-          path: upload/*
+          name: pif-${{ matrix.device }}
+          path: upload/*.json
           retention-days: 1
 
-  # ------------------------------------------------------------------
-  # RELEASE: Aggregate all built modules, create GitHub release, notify Telegram
-  # ------------------------------------------------------------------
   release:
     needs: [prepare, build]
     runs-on: ubuntu-latest
     if: always()
+    permissions:
+      contents: write
     steps:
       - name: Download artifacts
         uses: actions/download-artifact@v4
         with:
-          pattern: module-*
+          pattern: pif-*
           merge-multiple: true
-          path: new_modules/
+          path: new_pifs/
         continue-on-error: true
 
-      # Collect all modules, generate release notes, publish release, and notify
-      - name: Aggregate and publish
-        id: aggregate
+      # Publish each per-device configuration separately to avoid asset-name collisions.
+      - name: Publish PIF JSON files
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}
-          # Pass device list via env to avoid subshell/quote issues
-          DEVICES_JSON: ${{ needs.prepare.outputs.devices }}
         run: |
-          COUNT=$(ls new_modules/*.zip 2>/dev/null | wc -l)
-          if [ "$COUNT" -eq 0 ]; then
-            echo "has_new=false" >> "$GITHUB_OUTPUT"
+          mkdir -p new_pifs
+          shopt -s nullglob
+          pif_files=(new_pifs/*.json)
+          if [ "${#pif_files[@]}" -eq 0 ]; then
+            echo "No new PIF configurations to release."
             exit 0
           fi
 
-          TAG="build-$(date +%Y%m%d)"
-          REPO_URL="https://github.com/${{ github.repository }}"
+          for source in "${pif_files[@]}"; do
+            filename=$(basename "$source")
+            TAG="${filename%.json}"
+            asset_dir="release_assets/$TAG"
+            asset="$asset_dir/pif.json"
+            mkdir -p "$asset_dir"
+            cp "$source" "$asset"
 
-          # Read ordered device list into a bash array (avoids subshell issues)
-          mapfile -t devices < <(echo "$DEVICES_JSON" | jq -r '.[]')
+            model=$(jq -r '.MODEL // "Unknown"' "$source")
+            device=$(jq -r '.DEVICE // "Unknown"' "$source")
+            android_version=$(jq -r '."VERSION.RELEASE" // "Unknown"' "$source")
+            build_id=$(jq -r '.ID // "Unknown"' "$source")
+            incremental=$(jq -r '."VERSION.INCREMENTAL" // "Unknown"' "$source")
+            security_patch=$(jq -r '.SECURITY_PATCH // "Unknown"' "$source")
+            fingerprint=$(jq -r '.FINGERPRINT // "Unknown"' "$source")
+            sha256=$(sha256sum "$source" | awk '{print $1}')
+            notes="release_assets/$TAG/release-notes.md"
 
-          # Build per-device release notes in prepare-step order
-          RELEASE_BODY="Automated build with $COUNT new module(s)."$'\n\n'
-          for device in "${devices[@]}"; do
-            json="new_modules/metadata-${device}.json"
-            [ -f "$json" ] || continue
+            {
+              printf '## %s (%s)\n\n' "$model" "$device"
+              printf -- '- **Android version:** %s\n' "$android_version"
+              printf -- '- **Build ID:** %s\n' "$build_id"
+              printf -- '- **Incremental:** %s\n' "$incremental"
+              printf -- '- **Security patch:** %s\n' "$security_patch"
+              printf -- '- **Fingerprint:** `%s`\n' "$fingerprint"
+              printf -- '- **Download:** `pif.json`\n'
+              printf -- '- **SHA-256:** `%s`\n' "$sha256"
+            } > "$notes"
 
-            codename=$(jq -r '.codename' "$json")
-            zip_name=$(jq -r '.zip_name' "$json")
-            sha256=$(jq -r '.sha256' "$json")
-            device_name=$(jq -r '.device_name' "$json")
-            build_desc=$(jq -r '.build_desc // empty' "$json")
-
-            RELEASE_BODY+="## ${device_name} (${codename^})"$'\n'
-            RELEASE_BODY+="- File name: \`${zip_name}\`"$'\n'
-            RELEASE_BODY+="- Build Description: \`${build_desc}\`"$'\n'
-            RELEASE_BODY+="- File hash (SHA256): \`${sha256}\`"$'\n\n'
+            title="$device-$(date +%Y%m%d)"
+            if gh release view "$TAG" &>/dev/null; then
+              echo "Release $TAG already exists, replacing pif.json..."
+              gh release upload "$TAG" "$asset" --clobber
+              gh release edit "$TAG" --title "$title" --notes-file "$notes"
+            else
+              gh release create "$TAG" \
+                --title "$title" \
+                --notes-file "$notes" \
+                "$asset"
+            fi
           done
-
-          printf '%s' "$RELEASE_BODY" > /tmp/release_notes.md
-
-          # Build Telegram device list in the same order
-          DEVICE_LIST=""
-          for device in "${devices[@]}"; do
-            json="new_modules/metadata-${device}.json"
-            [ -f "$json" ] || continue
-            zip_name=$(jq -r '.zip_name' "$json")
-            device_name=$(jq -r '.device_name' "$json")
-            download_url="${REPO_URL}/releases/download/${TAG}/${zip_name}"
-            DEVICE_LIST+="- **${device_name}**: [${zip_name}](${download_url})"$'\n'
-          done
-
-          # Create release if it doesn't exist, otherwise upload to existing
-          if gh release view "$TAG" &>/dev/null; then
-            echo "Release $TAG already exists, uploading assets..."
-            gh release upload "$TAG" new_modules/*.zip --clobber
-          else
-            gh release create "$TAG" \
-              --title "$TAG" \
-              --notes-file /tmp/release_notes.md \
-              new_modules/*.zip
-          fi
-
-          echo "has_new=true" >> "$GITHUB_OUTPUT"
-          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
-          echo "count=$COUNT" >> "$GITHUB_OUTPUT"
-          {
-            echo "devices<<EOF"
-            printf '%s' "$DEVICE_LIST"
-            echo "EOF"
-          } >> "$GITHUB_OUTPUT"

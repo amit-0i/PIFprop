@@ -1,0 +1,15 @@
+{
+    "MANUFACTURER": "$ro.product.vendor.manufacturer",
+    "MODEL": "$ro.product.vendor.model",
+    "FINGERPRINT": "$ro.vendor.build.fingerprint",
+    "BRAND": "$ro.product.vendor.brand",
+    "PRODUCT": "$ro.product.vendor.name",
+    "DEVICE": "$ro.product.vendor.device",
+    "VERSION.RELEASE": "$ro.vendor.build.version.release",
+    "ID": "$ro.vendor.build.id",
+    "VERSION.INCREMENTAL": "$ro.vendor.build.version.incremental",
+    "TYPE": "$ro.vendor.build.type",
+    "TAGS": "$ro.vendor.build.tags",
+    "VERSION.DEVICE_INITIAL_SDK_INT": "$ro.vendor.build.version.sdk",
+    "SECURITY_PATCH": "$ro.vendor.build.security_patch"
+}
