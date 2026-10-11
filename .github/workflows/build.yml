@@ -8,7 +8,7 @@ on:
     inputs:
       devices:
         description: 'Device codenames (space-separated, or "all")'
-        required: true
+        required: false
         default: 'kodiak'
 
 permissions:
@@ -26,21 +26,7 @@ jobs:
       - name: Determine device list
         id: set_devices
         run: |
-          # Pixel 6 and newer (Tensor-era devices with modern partition layout)
-          if [ "${{ github.event.inputs.devices }}" = "all" ] || [ -z "${{ github.event.inputs.devices }}" ]; then
-            JSON='[
-              "oriole", "raven", "bluejay",
-              "panther", "cheetah", "lynx",
-              "felix", "tangorpro",
-              "shiba", "husky", "akita",
-              "tokay", "caiman", "komodo", "comet", "tegu",
-              "frankel", "blazer", "mustang", "stallion", "rango",
-              "cubs", "grizzly", "kodiak", "yogi"
-            ]'
-          else
-            # Convert space-separated input into a JSON array
-            JSON=$(echo '${{ github.event.inputs.devices }}' | tr ' ' '\n' | jq -R . | jq -s .)
-          fi
+          JSON='["kodiak"]'
           {
             echo "devices<<EOF"
             echo "$JSON"
@@ -218,7 +204,7 @@ jobs:
               printf -- '- **SHA-256:** `%s`\n' "$sha256"
             } > "$notes"
 
-            title="$device-$(date +%Y%m%d)"
+            title="$(date +%Y%m%d)-$device"
             if gh release view "$TAG" &>/dev/null; then
               echo "Release $TAG already exists, replacing pif.json..."
               gh release upload "$TAG" "$asset" --clobber
