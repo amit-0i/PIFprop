@@ -8,7 +8,7 @@ on:
     inputs:
       devices:
         description: 'Device codenames (space-separated, or "all")'
-        required: false
+        required: true
         default: 'kodiak'
 
 permissions:
@@ -26,7 +26,15 @@ jobs:
       - name: Determine device list
         id: set_devices
         run: |
-          JSON='["kodiak"]'
+          # Pixel 6 and newer (Tensor-era devices with modern partition layout)
+          if [ "${{ github.event.inputs.devices }}" = "all" ] || [ -z "${{ github.event.inputs.devices }}" ]; then
+            JSON='[
+              "kodiak"
+            ]'
+          else
+            # Convert space-separated input into a JSON array
+            JSON=$(echo '${{ github.event.inputs.devices }}' | tr ' ' '\n' | jq -R . | jq -s .)
+          fi
           {
             echo "devices<<EOF"
             echo "$JSON"
@@ -204,7 +212,7 @@ jobs:
               printf -- '- **SHA-256:** `%s`\n' "$sha256"
             } > "$notes"
 
-            title="$(date +%Y%m%d)-$device"
+            title="$device-$(date +%Y%m%d)"
             if gh release view "$TAG" &>/dev/null; then
               echo "Release $TAG already exists, replacing pif.json..."
               gh release upload "$TAG" "$asset" --clobber
